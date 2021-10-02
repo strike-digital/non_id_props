@@ -135,11 +135,7 @@ class _NonIDProperty():
             raise AttributeError(f"Property '{self.name}' is read-only")
         
         if value is None:
-            try:
-                del parent_cls[self.prop_name]
-            except KeyError:
-                pass
-            self._remove_msgbus_item()
+            self._reset_prop(parent_cls)  # Remove bl property and msgbus item
             return
 
         # Set the name property
@@ -159,6 +155,13 @@ class _NonIDProperty():
 
         if self.parent_update:
             self.parent_update(parent_cls, bpy.context)
+
+    def _reset_prop(self, parent_cls):
+        try:
+            del parent_cls[self.prop_name]
+        except KeyError:
+            pass
+        self._remove_msgbus_item()
 
     def _refresh_msgbus(self, parent_cls, parent_item):
         """Refresh the message bus to the newly set items name.
