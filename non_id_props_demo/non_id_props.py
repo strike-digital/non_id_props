@@ -3,7 +3,6 @@ from bpy import msgbus
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, CollectionProperty
 from typing import Callable, Any
-
 """This works by using a combination of the builtin python getters and setter, and the blender msgbus module
 * The setter is used to store the name of the given item as a Blender string
 * The getter is then used to return the item with the stored name
@@ -57,7 +56,8 @@ types = {
 
 
 # Use this function to return the prop rather than the instance, idk if this is the best way to do it
-def NonIDProperty(name: str, subtype: str,
+def NonIDProperty(name: str,
+                  subtype: str,
                   get: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None,
                   set: Callable[[bpy.types.PropertyGroup, bpy.types.Context, Any], Any] = None,
                   update: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None) -> property:
@@ -133,13 +133,9 @@ class _NonIDProperty():
 
         if self.parent_get and not self.parent_set:
             raise AttributeError(f"Property '{self.name}' is read-only")
-        
+
         if value is None:
-            try:
-                del parent_cls[self.prop_name]
-            except KeyError:
-                pass
-            self._remove_msgbus_item()
+            self._reset_prop(parent_cls)  # Remove bl property and msgbus item
             return
 
         # Set the name property
@@ -152,7 +148,7 @@ class _NonIDProperty():
         parent_item = parent_col[item_name]
 
         self._refresh_msgbus(parent_cls, parent_item)
-        self._add_msgbus_item(parent_cls)
+        self._add_msgbus_item(parent_cls, parent_item)
 
         if self.parent_set:
             self.parent_set(parent_cls, bpy.context, parent_item)
@@ -160,10 +156,17 @@ class _NonIDProperty():
         if self.parent_update:
             self.parent_update(parent_cls, bpy.context)
 
+    def _reset_prop(self, parent_cls):
+        try:
+            del parent_cls[self.prop_name]
+        except KeyError:
+            pass
+        self._remove_msgbus_item()
+
     def _refresh_msgbus(self, parent_cls, parent_item):
         """Refresh the message bus to the newly set items name.
         It will then call _on_change when the name is changed"""
-        msgbus.clear_by_owner(self)
+        # msgbus.clear_by_owner(self)
         subscribe_to = parent_item.path_resolve("name", False)
 
         global _on_change  # on_change must be a function rather than a method or msgbus doesn't like it
@@ -173,22 +176,24 @@ class _NonIDProperty():
             args=(self, parent_cls, parent_item),
             notify=_on_change,
         )
-    
-    def _add_msgbus_item(self, parent_cls):
+
+    def _add_msgbus_item(self, parent_cls, parent_item):
         """Adds an item that can be used to re-add the msgbuses correctly,
         when the file is loaded again"""
-        
+
         # Adds it to all scenes because I couldn't figure out how to register the msgbus items to the window manager,
         # without it resetting every time the file was opened.
         for scene in bpy.data.scenes:
-            try:
-                item = scene.non_id_props[self.prop_name[1:]]
-            except KeyError:
+            for item in scene.non_id_props:
+                if item.path == parent_cls.path_from_id() and item.name == self.name:
+                    break
+            else:
                 item = scene.non_id_props.add()
 
             item.type = types[parent_cls.id_data.bl_rna.identifier]
             item.path = parent_cls.path_from_id()
             item.name = self.name
+            item.non_id_prop_name = parent_item.name
 
     def _remove_msgbus_item(self):
         for scene in bpy.data.scenes:
@@ -201,7 +206,20 @@ def _on_change(*args):
     """This is called when the target items' name changes.
     It just sets the property to the new item"""
     self, parent_cls, parent_item = args
-    setattr(parent_cls, self.name, parent_item)
+    msgbus_items = bpy.data.scenes[0].non_id_props
+    for item in msgbus_items:
+        data_blocks = getattr(bpy.data, item.type)
+        for data_block in data_blocks:
+            
+            try:
+                parent_cls = data_block.path_resolve(item.path)
+            except ValueError:
+                continue
+            try:
+                _ = getattr(parent_cls, item.name)
+            except AttributeError:
+                setattr(parent_cls, item.name, parent_item)
+                continue
 
 
 class MsgbusItem(bpy.types.PropertyGroup):
@@ -214,6 +232,8 @@ class MsgbusItem(bpy.types.PropertyGroup):
 
     name: StringProperty(description="The name of the property")
 
+    non_id_prop_name: StringProperty(description="The name of the property")
+
 
 @persistent
 def non_id_prop_on_load(dummy):
@@ -224,18 +244,16 @@ def non_id_prop_on_load(dummy):
     msgbus_items = scene.non_id_props
     for item in msgbus_items:
         data_blocks = getattr(bpy.data, item.type)
-        for object in data_blocks:
+        for data_block in data_blocks:
             try:
-                parent_cls = object.path_resolve(item.path)
+                parent_cls = data_block.path_resolve(item.path)
             except ValueError:
                 continue
             val = getattr(parent_cls, item.name)
             setattr(parent_cls, item.name, val)
 
 
-classes = (
-    MsgbusItem,
-)
+classes = (MsgbusItem,)
 
 
 def register():
