@@ -3,6 +3,7 @@ from bpy import msgbus
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, CollectionProperty
 from typing import Callable, Any
+
 """This works by using a combination of the builtin python getters and setter, and the blender msgbus module
 * The setter is used to store the name of the given item as a Blender string
 * The getter is then used to return the item with the stored name
@@ -54,13 +55,19 @@ types = {
     'Movieclip': 'movieclips',
 }
 
+ID_PROP_VAR = "_id_type"
+PREV_NAME_VAR = "_prev_name"
+CHANGE_NAME_VAR = "_on_name_change"
+
 
 # Use this function to return the prop rather than the instance, idk if this is the best way to do it
 def NonIDProperty(name: str,
+                  id_type: None,
                   subtype: str,
                   get: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None,
                   set: Callable[[bpy.types.PropertyGroup, bpy.types.Context, Any], Any] = None,
-                  update: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None) -> property:
+                  update: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None,
+                  name_update: Callable[[bpy.types.PropertyGroup, bpy.types.Context, str], Any] = None) -> property:
     """Returns a property that can hold a reference to a blender property that is not a subclass of bpy.types.ID,
     even if that properties name is changed in the UI.
 
@@ -84,18 +91,23 @@ def NonIDProperty(name: str,
         property: a property that will still reference the item it is assigned to,
             even when the name of the item is changed
     """
-    return _NonIDProperty(name, subtype, get, set, update).prop
+    return _NonIDProperty(name, id_type, subtype, get, set, update, name_update).prop
 
 
 class _NonIDProperty():
 
-    def __init__(self, name, subtype, parent_get=None, parent_set=None, parent_update=None):
+    def __init__(self, name, id_type, subtype, parent_get=None, parent_set=None, parent_update=None, name_update=None):
+        if not issubclass(id_type, bpy.types.ID):
+            raise AttributeError(f"id_type '{id_type.__name__}' is not a subclass of bpy.types.ID")
+        
+        self.id_type = id_type
         self.subtype = subtype
         self.name = name
         self.prop_name = "_" + name
         self.parent_get = parent_get
         self.parent_set = parent_set
         self.parent_update = parent_update
+        self.name_update = name_update
         self.prop = property(self._get_prop, self._set_prop)
         # uses built in python getters and setters:
         # https://www.python-course.eu/python3_properties.php
@@ -108,7 +120,7 @@ class _NonIDProperty():
             return self.parent_get(parent_cls, bpy.context)
 
         # gets the collection property
-        col_prop = getattr(parent_cls.id_data, self.subtype)
+        col_prop = self._get_col_prop(parent_cls)
         try:
             # get the name of the item of the collection property
             prop_name = parent_cls[self.prop_name]
@@ -136,29 +148,61 @@ class _NonIDProperty():
 
         if value is None:
             self._reset_prop(parent_cls)  # Remove bl property and msgbus item
-            return
+        else:
+            # Set the name property
+            parent_cls[self.prop_name] = value.name
 
-        # Set the name property
-        parent_cls[self.prop_name] = value.name
+            # get the collection property
+            parent_col = self._get_col_prop(parent_cls)
+            item_name = parent_cls[self.prop_name]
+            # get the item from the collection property
+            parent_item = parent_col[item_name]
 
-        # get the collection property
-        parent_col = getattr(parent_cls.id_data, self.subtype)
-        item_name = parent_cls[self.prop_name]
-        # get the item from the collection property
-        parent_item = parent_col[item_name]
+            self._refresh_msgbus(parent_cls, parent_item)
+            self._add_msgbus_item(parent_cls, parent_item)
 
-        self._refresh_msgbus(parent_cls, parent_item)
-        self._add_msgbus_item(parent_cls, parent_item)
+        # check if update is called from the name changing
+        change_name_prop = self.prop_name + CHANGE_NAME_VAR
+        prev_name_prop = self.prop_name + PREV_NAME_VAR
+        try:
+            name_changed = parent_cls[change_name_prop]
+        except KeyError:
+            name_changed = parent_cls[change_name_prop] = False
 
-        if self.parent_set:
-            self.parent_set(parent_cls, bpy.context, parent_item)
+        # call update functions
+        if name_changed:
+            if self.name_update:
+                prev_name = parent_cls.get(prev_name_prop, "")
+                # check if name_update is the same as update, and pass correct number of args for convenience
+                if self.parent_update == self.name_update:
+                    self.name_update(parent_cls, bpy.context)
+                else:
+                    self.name_update(parent_cls, bpy.context, prev_name)
+            parent_cls[change_name_prop] = False
+            parent_cls[prev_name_prop] = value.name
+        else:
+            if self.parent_set:
+                self.parent_set(parent_cls, bpy.context, parent_item)
 
-        if self.parent_update:
-            self.parent_update(parent_cls, bpy.context)
+            if self.parent_update:
+                self.parent_update(parent_cls, bpy.context)
+
+    def _get_col_prop(self, parent_cls):
+        """Parse the subtype into it's parts, as getattr() doesn't work with subpaths.
+        e.g. getattr(object, 'my_prop.my_list') wouldn't work otherwise."""
+        parts = self.subtype.split(".")
+        col_prop = parent_cls.id_data
+        for part in parts:
+            col_prop = getattr(col_prop, part)
+        return col_prop
 
     def _reset_prop(self, parent_cls):
+        """Remove stored property and msgbus subscriber"""
         try:
             del parent_cls[self.prop_name]
+            del parent_cls[self.prop_name + PREV_NAME_VAR]
+            del parent_cls[self.prop_name + CHANGE_NAME_VAR]
+            del parent_cls[self.prop_name + ID_PROP_VAR]
         except KeyError:
             pass
         self._remove_msgbus_item()
@@ -210,7 +254,7 @@ def _on_change(*args):
     for item in msgbus_items:
         data_blocks = getattr(bpy.data, item.type)
         for data_block in data_blocks:
-            
+
             try:
                 parent_cls = data_block.path_resolve(item.path)
             except ValueError:
@@ -218,6 +262,7 @@ def _on_change(*args):
             try:
                 _ = getattr(parent_cls, item.name)
             except AttributeError:
+                parent_cls["_" + item.name + CHANGE_NAME_VAR] = True
                 setattr(parent_cls, item.name, parent_item)
                 continue
 
@@ -265,6 +310,11 @@ def register():
     # but for some reason it didn't save with the file,
     # and was reset when loading a new one
     bpy.types.Scene.non_id_props = CollectionProperty(type=MsgbusItem)
+
+    def my_func():
+        print("hoh")
+
+    MsgbusItem.my_func = my_func
 
 
 def unregister():
