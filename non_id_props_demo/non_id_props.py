@@ -3,7 +3,6 @@ from bpy import msgbus
 from bpy.app.handlers import persistent
 from bpy.props import StringProperty, CollectionProperty
 from typing import Callable, Any
-
 """This works by using a combination of the builtin python getters and setter, and the blender msgbus module
 * The setter is used to store the name of the given item as a Blender string
 * The getter is then used to return the item with the stored name
@@ -53,6 +52,11 @@ types = {
     'Material': 'materials',
     'Texture': 'textures',
     'Movieclip': 'movieclips',
+    'CompositorNodeTree': "node_groups",
+    'GeometryNodeTree': "node_groups",
+    'NodeTree': "node_groups",
+    'ShaderNodeTree': "node_groups",
+    'TextureNodeTree': "node_groups",
 }
 
 ID_PROP_VAR = "_id_type"
@@ -62,10 +66,9 @@ CHANGE_NAME_VAR = "_on_name_change"
 
 # Use this function to return the prop rather than the instance, idk if this is the best way to do it
 def NonIDProperty(name: str,
-                  id_type: None,
                   subtype: str,
-                  get: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None,
-                  set: Callable[[bpy.types.PropertyGroup, bpy.types.Context, Any], Any] = None,
+                  get: Callable[[bpy.types.PropertyGroup], Any] = None,
+                  set: Callable[[bpy.types.PropertyGroup, Any], Any] = None,
                   update: Callable[[bpy.types.PropertyGroup, bpy.types.Context], Any] = None,
                   name_update: Callable[[bpy.types.PropertyGroup, bpy.types.Context, str], Any] = None) -> property:
     """Returns a property that can hold a reference to a blender property that is not a subclass of bpy.types.ID,
@@ -91,16 +94,20 @@ def NonIDProperty(name: str,
         property: a property that will still reference the item it is assigned to,
             even when the name of the item is changed
     """
-    return _NonIDProperty(name, id_type, subtype, get, set, update, name_update).prop
+    return _NonIDProperty(name, subtype, get, set, update, name_update).prop
 
 
 class _NonIDProperty():
 
-    def __init__(self, name, id_type, subtype, parent_get=None, parent_set=None, parent_update=None, name_update=None):
-        if not issubclass(id_type, bpy.types.ID):
-            raise AttributeError(f"id_type '{id_type.__name__}' is not a subclass of bpy.types.ID")
-        
-        self.id_type = id_type
+    def __init__(
+        self,
+        name,
+        subtype,
+        parent_get=None,
+        parent_set=None,
+        parent_update=None,
+        name_update=None,
+    ):
         self.subtype = subtype
         self.name = name
         self.prop_name = "_" + name
@@ -117,15 +124,15 @@ class _NonIDProperty():
         """Return the item, from the name that is stored by the set function"""
 
         if self.parent_get:
-            return self.parent_get(parent_cls, bpy.context)
+            return self.parent_get(parent_cls)
 
         # gets the collection property
-        col_prop = self._get_col_prop(parent_cls)
         try:
             # get the name of the item of the collection property
             prop_name = parent_cls[self.prop_name]
         except KeyError:  # Not set yet
             return None
+        col_prop = self._get_col_prop(parent_cls)
         try:
             # get the collection property item
             return_prop = col_prop[prop_name]
@@ -148,9 +155,11 @@ class _NonIDProperty():
 
         if value is None:
             self._reset_prop(parent_cls)  # Remove bl property and msgbus item
+            parent_item = None
         else:
             # Set the name property
             parent_cls[self.prop_name] = value.name
+            parent_cls[self.prop_name + ID_PROP_VAR] = value.id_data
 
             # get the collection property
             parent_col = self._get_col_prop(parent_cls)
@@ -182,7 +191,7 @@ class _NonIDProperty():
             parent_cls[prev_name_prop] = value.name
         else:
             if self.parent_set:
-                self.parent_set(parent_cls, bpy.context, parent_item)
+                self.parent_set(parent_cls, parent_item)
 
             if self.parent_update:
                 self.parent_update(parent_cls, bpy.context)
@@ -190,8 +199,10 @@ class _NonIDProperty():
     def _get_col_prop(self, parent_cls):
         """Parse the subtype into it's parts, as getattr() doesn't work with subpaths.
         e.g. getattr(object, 'my_prop.my_list') wouldn't work otherwise."""
+        col_prop = parent_cls[self.prop_name + ID_PROP_VAR]
+
         parts = self.subtype.split(".")
-        col_prop = parent_cls.id_data
+        # col_prop = parent_cls.id_data
         for part in parts:
             col_prop = getattr(col_prop, part)
         return col_prop
@@ -234,7 +245,8 @@ class _NonIDProperty():
             else:
                 item = scene.non_id_props.add()
 
-            item.type = types[parent_cls.id_data.bl_rna.identifier]
+            id_prop = parent_cls.id_data
+            item.type = types[id_prop.bl_rna.identifier]
             item.path = parent_cls.path_from_id()
             item.name = self.name
             item.non_id_prop_name = parent_item.name
@@ -259,6 +271,7 @@ def _on_change(*args):
                 parent_cls = data_block.path_resolve(item.path)
             except ValueError:
                 continue
+
             try:
                 _ = getattr(parent_cls, item.name)
             except AttributeError:
@@ -311,10 +324,10 @@ def register():
     # and was reset when loading a new one
     bpy.types.Scene.non_id_props = CollectionProperty(type=MsgbusItem)
 
-    def my_func():
-        print("hoh")
 
-    MsgbusItem.my_func = my_func
+def unregister():
+    for cls in classes:
+        bpy.utils.unregister_class(cls)
 
-
-def u
+    bpy.app.handlers.load_post.remove(non_id_prop_on_load)
+    del bpy.types.Scene.non_id_props
