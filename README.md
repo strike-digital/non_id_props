@@ -19,7 +19,7 @@ Example usage:
 
 ```py
 my_vgroup = NonIDProperty(
-  name="my_prop",
+  name="my_vgroup",
   subtype="vertex_groups",
   update=my_vgroup_update_func,
   )
